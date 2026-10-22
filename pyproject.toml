@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zhangchui-mcp"
+version = "0.1.1"
+description = "Read-only MCP adapter for published Zhangchui Warhammer 40,000 reports"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["mcp==2.3.0"]
+
+[project.scripts]
+zhangchui-mcp = "zhangchui_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+zhangchui_mcp = ["py.typed"]

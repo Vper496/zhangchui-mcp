@@ -1,0 +1,7 @@
+include LICENSE README.md requirements-lock.txt
+recursive-include examples *.json
+recursive-include tests *.py
+recursive-include src *.py py.typed
+prune .venv
+prune build
+prune dist
