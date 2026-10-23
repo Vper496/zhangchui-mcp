@@ -13,12 +13,14 @@ from zhangchui_mcp.client import ClientConfig, PublicQueryClient, QueryError
 
 RELEASE = 'a' * 64
 REPORT = 'b' * 64
+REVISION = 'c' * 64
 TEST_KEY = 'synthetic-client-key-only'
 
 
 def document(**extra):
     return {'data': {'items': [], 'unknown': None, **extra}, 'meta': {'schema': 'public-query/1',
-        'read_only': True, 'published_at': '2026-10-22T00:00:00+00:00', 'release_id': RELEASE}}
+        'read_only': True, 'published_at': '2026-10-22T00:00:00+00:00', 'release_id': RELEASE,
+        'dataset_revision': REVISION}}
 
 
 class Response(io.BytesIO):
@@ -93,7 +95,7 @@ class PublicQueryClientTests(unittest.TestCase):
         self.assertEqual(len(opener.calls), 2)
 
     def test_withdrawal_or_unavailable_never_falls_back_to_cache(self):
-        for status in [403, 404, 410, 429, 503]:
+        for status in [403, 404, 409, 410, 429, 503]:
             with self.subTest(status=status):
                 opener = Opener(Response(headers={'ETag': '"fixed"'}), error(status, retry_after=17))
                 client = PublicQueryClient(self.config(), opener=opener)
@@ -183,6 +185,10 @@ class PublicQueryClientTests(unittest.TestCase):
                 client.query('catalog', **parameters)
         with self.assertRaises(QueryError):
             client.query('roster', report_id=REPORT, case_id='../../manage')
+        with self.assertRaises(QueryError):
+            client.query('roster', report_id=REPORT, case_id=123)
+        with self.assertRaises(QueryError):
+            client.query(['catalog'])
 
     def test_cache_has_a_byte_budget_and_isolated_query_keys(self):
         opener = Opener(Response(document(value='x' * 200), headers={'ETag': '"one"'}),
@@ -192,6 +198,75 @@ class PublicQueryClientTests(unittest.TestCase):
         client.query('catalog', page=2)
         self.assertLessEqual(sum(len(row[1]) for row in client._cache.values()), 600)
         self.assertEqual(len(client._cache), 1)
+
+    def test_fixed_revision_is_sent_on_all_resources_and_revalidated_from_cache(self):
+        resources = [('catalog', {}), ('report', {'report_id': REPORT}),
+                     ('matchups', {'report_id': REPORT}), ('rosters', {'report_id': REPORT}),
+                     ('roster', {'report_id': REPORT, 'case_id': 'd' * 64}),
+                     ('notes', {'report_id': REPORT}), ('dataset_manifest', {}),
+                     ('dataset_rows', {'table': 'reports', 'page': 1})]
+        for resource, arguments in resources:
+            with self.subTest(resource=resource):
+                opener = Opener(Response(headers={'ETag': '"fixed"'}), error(304))
+                client = PublicQueryClient(self.config(), opener=opener)
+                first = client.query(resource, release_id=RELEASE, dataset_revision=REVISION, **arguments)
+                second = client.query(resource, release_id=RELEASE, dataset_revision=REVISION, **arguments)
+                self.assertEqual(first, second)
+                self.assertIn('dataset_revision=' + REVISION, opener.calls[0][0].full_url)
+                self.assertEqual(opener.calls[1][0].get_header('If-none-match'), '"fixed"')
+
+    def test_revision_conflict_clears_cache_and_cannot_be_silently_retried(self):
+        opener = Opener(Response(headers={'ETag': '"fixed"'}), error(409, code='DATASET_REVISION_CHANGED'))
+        client = PublicQueryClient(self.config(), opener=opener)
+        client.query('catalog', release_id=RELEASE, dataset_revision=REVISION)
+        with self.assertRaises(QueryError) as result:
+            client.query('catalog', release_id=RELEASE, dataset_revision=REVISION)
+        self.assertEqual(result.exception.document['error']['code'], 'DATASET_REVISION_CHANGED')
+        self.assertEqual(len(opener.calls), 2)
+        self.assertFalse(client._cache)
+
+    def test_wrong_or_missing_revision_in_success_response_is_rejected_when_pinned(self):
+        missing = document()
+        missing['meta'].pop('dataset_revision')
+        wrong = document()
+        wrong['meta']['dataset_revision'] = 'd' * 64
+        malformed = document()
+        malformed['meta']['dataset_revision'] = 5
+        for value in (missing, wrong, malformed):
+            with self.subTest(value=value['meta']):
+                client = PublicQueryClient(self.config(), opener=Opener(Response(value)))
+                with self.assertRaises(QueryError) as result:
+                    client.query('catalog', dataset_revision=REVISION)
+                self.assertEqual(result.exception.document['error']['code'], 'UPSTREAM_PROTOCOL')
+                self.assertFalse(client._cache)
+        legacy = PublicQueryClient(self.config(), opener=Opener(Response(missing)))
+        self.assertIn('data', legacy.query('catalog'))
+
+    def test_revisions_isolate_cache_entries_and_allow_normal_updates_without_client_upgrade(self):
+        changed = document()
+        changed['meta']['dataset_revision'] = 'd' * 64
+        opener = Opener(Response(headers={'ETag': '"first"'}), Response(changed, headers={'ETag': '"second"'}))
+        client = PublicQueryClient(self.config(), opener=opener)
+        client.query('catalog', dataset_revision=REVISION)
+        updated = client.query('catalog', dataset_revision='d' * 64)
+        self.assertEqual(updated['meta']['dataset_revision'], 'd' * 64)
+        self.assertIsNone(opener.calls[1][0].get_header('If-none-match'))
+        self.assertEqual(len(client._cache), 2)
+
+    def test_dataset_routes_and_table_names_are_not_arbitrary_urls(self):
+        opener = Opener(Response(), Response())
+        client = PublicQueryClient(self.config(), opener=opener)
+        client.query('dataset_manifest')
+        client.query('dataset_rows', table='faction_statistics', page=2)
+        self.assertTrue(opener.calls[0][0].full_url.endswith('/datasets/manifest'))
+        self.assertIn('/datasets/rows?page=2&table=faction_statistics', opener.calls[1][0].full_url)
+        for resource, parameters in [('dataset_rows', {}), ('dataset_rows', {'table': '../reports'}),
+                                     ('dataset_rows', {'table': ['reports']}),
+                                     ('dataset_manifest', {'table': 'reports'}),
+                                     ('catalog', {'dataset_revision': 'wrong'})]:
+            with self.subTest(resource=resource, parameters=parameters), self.assertRaises(QueryError):
+                client.query(resource, **parameters)
+        self.assertEqual(len(opener.calls), 2)
 
     def test_concurrent_tools_have_only_one_http_request_in_flight(self):
         class ConcurrentOpener:

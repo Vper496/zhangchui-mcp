@@ -15,6 +15,7 @@ from . import __version__
 
 API_SCHEMA = 'public-query/1'
 DEFAULT_BASE_URL = 'https://40kdata.online/api/v1/public-query'
+DATASET_TABLES = frozenset({'reports', 'faction_statistics', 'matchup_statistics'})
 
 
 class QueryError(Exception):
@@ -77,13 +78,16 @@ def _identifier(value, name):
 
 
 def _parameters(parameters):
-    allowed = {'release_id', 'page', 'type', 'format', 'version_id', 'report_source',
+    allowed = {'release_id', 'dataset_revision', 'page', 'table', 'type', 'format', 'version_id', 'report_source',
                'date_from', 'date_to', 'faction_id', 'opponent_id'}
     if set(parameters) - allowed:
         raise QueryError('INVALID_ARGUMENT', '包含未支持的查询参数')
     result = {key: value for key, value in parameters.items() if value is not None}
-    if 'release_id' in result:
-        _identifier(result['release_id'], 'release_id')
+    for key in ('release_id', 'dataset_revision'):
+        if key in result:
+            _identifier(result[key], key)
+    if 'table' in result and (not isinstance(result['table'], str) or result['table'] not in DATASET_TABLES):
+        raise QueryError('INVALID_ARGUMENT', 'table须使用manifest列出的公开统计表名')
     if 'page' in result and (type(result['page']) is not int or not 1 <= result['page'] <= 10000):
         raise QueryError('INVALID_ARGUMENT', 'page须为1到10000的整数')
     for key, value in result.items():
@@ -111,19 +115,26 @@ class PublicQueryClient:
         self._cache = OrderedDict()
 
     def query(self, resource, *, report_id=None, case_id=None, **parameters):
-        if resource == 'roster':
-            _identifier(case_id, 'case_id')
-        path = '/reports'
-        if resource != 'catalog':
-            path += '/' + _identifier(report_id, 'report_id')
         suffixes = {'catalog': '', 'report': '', 'matchups': '/matchups',
-                    'rosters': '/rosters', 'roster': '/rosters/' + (case_id or ''), 'notes': '/data-notes'}
-        if resource not in suffixes:
+                    'rosters': '/rosters', 'roster': '/rosters/', 'notes': '/data-notes'}
+        if not isinstance(resource, str):
             raise QueryError('INVALID_ARGUMENT', '工具只支持公开查询')
-        if resource == 'roster':
-            _identifier(case_id, 'case_id')
-        path += suffixes[resource]
+        if resource in {'dataset_manifest', 'dataset_rows'}:
+            path = '/datasets/' + ('manifest' if resource == 'dataset_manifest' else 'rows')
+        elif resource in suffixes:
+            path = '/reports'
+            if resource != 'catalog':
+                path += '/' + _identifier(report_id, 'report_id')
+            path += suffixes[resource]
+            if resource == 'roster':
+                path += _identifier(case_id, 'case_id')
+        else:
+            raise QueryError('INVALID_ARGUMENT', '工具只支持公开查询')
         params = _parameters(parameters)
+        if resource == 'dataset_rows' and 'table' not in params:
+            raise QueryError('INVALID_ARGUMENT', '请先从manifest选择table，再读取统计表')
+        if resource != 'dataset_rows' and 'table' in params:
+            raise QueryError('INVALID_ARGUMENT', '只有统计表读取支持table参数')
         url = self.config.base_url.rstrip('/') + path
         if params:
             url += '?' + urlencode(sorted(params.items()))
@@ -133,11 +144,11 @@ class PublicQueryClient:
                 if delay > 0:
                     self.sleep(delay)
             try:
-                return self._request(url, params.get('release_id'))
+                return self._request(url, params.get('release_id'), params.get('dataset_revision'))
             finally:
                 self._last_finished = self.clock()
 
-    def _request(self, url, release_id):
+    def _request(self, url, release_id, dataset_revision):
         if not self.config.api_key:
             raise QueryError('MCP_KEY_REQUIRED', '请在MCP配置里设置ZHANGCHUI_API_KEY，填写发放给你的密钥', status=401)
         cached = self._cache.get(url)
@@ -153,7 +164,7 @@ class PublicQueryClient:
                 if error.code == 304 and cached:
                     error.close()
                     self._cache.move_to_end(url)
-                    return self._decode(cached[1], release_id)
+                    return self._decode(cached[1], release_id, dataset_revision)
                 with error:
                     raw = error.read(min(self.config.response_limit_bytes, 65536) + 1)
                     raise self._upstream_error(error.code, error.headers, raw)
@@ -168,7 +179,7 @@ class PublicQueryClient:
                 raw = response.read(self.config.response_limit_bytes + 1)
                 if len(raw) > self.config.response_limit_bytes:
                     raise QueryError('RESPONSE_TOO_LARGE', '服务响应超过读取上限，请缩小查询范围')
-                data = self._decode(raw, release_id)
+                data = self._decode(raw, release_id, dataset_revision)
                 etag = response.headers.get('ETag')
                 if etag and len(etag) <= 256:
                     self._remember(url, etag, raw)
@@ -180,7 +191,7 @@ class PublicQueryClient:
             self._cache.pop(url, None)
             raise QueryError('CONNECTION_FAILED', '无法连接公开查询服务，请稍后重试') from error
 
-    def _decode(self, raw, release_id):
+    def _decode(self, raw, release_id, dataset_revision):
         try:
             data = json.loads(raw, parse_constant=_invalid_number)
             meta = data['meta']
@@ -190,6 +201,13 @@ class PublicQueryClient:
                 raise ValueError()
             datetime.fromisoformat(meta['published_at'].replace('Z', '+00:00'))
             if release_id is not None and meta['release_id'] != release_id:
+                raise ValueError()
+            # Unpinned calls remain compatible with older servers. A pinned call
+            # must prove its revision, even if an upstream incorrectly returns 200.
+            revision = meta.get('dataset_revision')
+            if revision is not None and (not isinstance(revision, str) or not re.fullmatch('[0-9a-f]{64}', revision)):
+                raise ValueError()
+            if dataset_revision is not None and revision != dataset_revision:
                 raise ValueError()
             if 'data' not in data:
                 raise ValueError()
