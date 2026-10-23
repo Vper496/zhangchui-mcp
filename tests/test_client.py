@@ -13,6 +13,7 @@ from zhangchui_mcp.client import ClientConfig, PublicQueryClient, QueryError
 
 RELEASE = 'a' * 64
 REPORT = 'b' * 64
+TEST_KEY = 'synthetic-client-key-only'
 
 
 def document(**extra):
@@ -48,7 +49,7 @@ def error(status, *, code='RELEASE_WITHDRAWN', retry_after=None):
 
 class PublicQueryClientTests(unittest.TestCase):
     def config(self, **values):
-        return ClientConfig(minimum_interval_seconds=0, **values)
+        return ClientConfig(minimum_interval_seconds=0, api_key=TEST_KEY, **values)
 
     def test_get_only_request_retains_null_version_and_filters(self):
         opener = Opener(Response())
@@ -58,10 +59,28 @@ class PublicQueryClientTests(unittest.TestCase):
         self.assertEqual(request.method, 'GET')
         self.assertIn('/api/v1/public-query/reports?', request.full_url)
         self.assertIn('release_id=' + RELEASE, request.full_url)
-        self.assertNotIn('Authorization', request.headers)
+        self.assertEqual(request.get_header('Authorization'), 'Bearer ' + TEST_KEY)
         self.assertNotIn('Cookie', request.headers)
         self.assertIsNone(result['data']['unknown'])
         self.assertEqual(timeout, 15)
+
+    def test_missing_key_does_not_send_an_anonymous_request(self):
+        opener = Opener()
+        client = PublicQueryClient(ClientConfig(), opener=opener)
+        with self.assertRaises(QueryError) as result:
+            client.query('catalog')
+        self.assertEqual(result.exception.document['error']['code'], 'MCP_KEY_REQUIRED')
+        self.assertEqual(opener.calls, [])
+
+    def test_revoked_key_never_reuses_cached_results_and_secret_is_not_in_repr(self):
+        opener = Opener(Response(headers={'ETag': 'W/"fixed"'}), error(401, code='MCP_KEY_REVOKED'))
+        client = PublicQueryClient(self.config(), opener=opener)
+        client.query('catalog')
+        with self.assertRaises(QueryError):
+            client.query('catalog')
+        self.assertEqual(len(client._cache), 0)
+        self.assertNotIn(TEST_KEY, repr(client.config))
+        self.assertNotIn(TEST_KEY, opener.calls[0][0].full_url)
 
     def test_cached_results_are_revalidated_and_return_new_objects(self):
         opener = Opener(Response(headers={'ETag': 'W/"fixed"'}), error(304))
@@ -205,7 +224,7 @@ class PublicQueryClientTests(unittest.TestCase):
             clock[0] += seconds
 
         opener = Opener(Response(), Response())
-        client = PublicQueryClient(ClientConfig(minimum_interval_seconds=2), opener=opener,
+        client = PublicQueryClient(ClientConfig(minimum_interval_seconds=2, api_key=TEST_KEY), opener=opener,
                                    clock=lambda: clock[0], sleep=sleep)
         client.query('catalog')
         client.query('catalog')

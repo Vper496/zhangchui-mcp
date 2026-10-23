@@ -4,7 +4,8 @@
       "command": "C:/replace/zhangchui-mcp/.venv/Scripts/python.exe",
       "args": ["-X", "utf8", "-m", "zhangchui_mcp"],
       "env": {
-        "ZHANGCHUI_API_BASE": "https://40kdata.online/api/v1/public-query"
+        "ZHANGCHUI_API_BASE": "https://40kdata.online/api/v1/public-query",
+        "ZHANGCHUI_API_KEY": "replace-with-your-issued-key"
       }
     }
   }

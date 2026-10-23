@@ -1,6 +1,6 @@
 """Bounded GET-only client with live conditional revalidation and no stale fallback."""
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from http.client import HTTPException
 import ipaddress
@@ -11,6 +11,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from . import __version__
 
 API_SCHEMA = 'public-query/1'
 DEFAULT_BASE_URL = 'https://40kdata.online/api/v1/public-query'
@@ -31,10 +32,17 @@ class ClientConfig:
     output_limit_bytes: int = 512 * 1024
     cache_limit_bytes: int = 4 * 1024 * 1024
     allow_loopback_http: bool = False
+    api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
-        parsed = urlsplit(self.base_url)
-        port = parsed.port
+        if self.api_key is not None and (not isinstance(self.api_key, str) or not 16 <= len(self.api_key) <= 256
+                or not re.fullmatch(r'[A-Za-z0-9_-]+', self.api_key)):
+            raise ValueError('访问密钥格式无效，请填写发放给你的完整密钥')
+        try:
+            parsed = urlsplit(self.base_url)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError('API地址格式无效，访问密钥请单独配置') from None
         local = parsed.hostname == 'localhost'
         try:
             local = local or ipaddress.ip_address(parsed.hostname or '').is_loopback
@@ -130,8 +138,11 @@ class PublicQueryClient:
                 self._last_finished = self.clock()
 
     def _request(self, url, release_id):
+        if not self.config.api_key:
+            raise QueryError('MCP_KEY_REQUIRED', '请在MCP配置里设置ZHANGCHUI_API_KEY，填写发放给你的密钥', status=401)
         cached = self._cache.get(url)
-        headers = {'Accept': 'application/json', 'Accept-Encoding': 'identity', 'User-Agent': 'zhangchui-mcp/0.1.0'}
+        headers = {'Accept': 'application/json', 'Accept-Encoding': 'identity',
+                   'User-Agent': 'zhangchui-mcp/' + __version__, 'Authorization': 'Bearer ' + self.config.api_key}
         if cached:
             headers['If-None-Match'] = cached[0]
         request = Request(url, headers=headers, method='GET')

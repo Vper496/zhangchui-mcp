@@ -13,6 +13,7 @@ async def main():
     fixture = json.loads(fixture_path.read_bytes())
     parameters = StdioServerParameters(command=sys.executable, args=['-m', 'zhangchui_mcp', '--base-url',
         fixture['base_url'], '--allow-loopback-http'], env={'ZHANGCHUI_MIN_INTERVAL_SECONDS': '0',
+        'ZHANGCHUI_API_KEY_FILE': fixture['key_file'],
         'PYTHONIOENCODING': 'utf-8'})
     report_id = fixture['report_id']
     pinned = {'report_id': report_id, 'release_id': fixture['release_id']}
@@ -50,7 +51,7 @@ async def main():
         withdrawn = await client.call_tool('get_report', pinned)
         assert withdrawn.is_error and withdrawn.structured_content['error']['status'] == 410
         result.update(unpublished_rejected=True, withdrawal_precedes_cached_content=True,
-                      structured_errors=True, credential_free=True)
+                      structured_errors=True, issued_key_required=True, administrator_credentials_unused=True)
     output_path.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
 
 

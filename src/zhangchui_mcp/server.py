@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Annotated
 
 import anyio
@@ -81,9 +82,24 @@ def main():
     parser.add_argument('--allow-loopback-http', action='store_true', help='仅本地开发：允许回环HTTP')
     args = parser.parse_args()
     try:
+        key = os.environ.get('ZHANGCHUI_API_KEY')
+        key_file = os.environ.get('ZHANGCHUI_API_KEY_FILE')
+        if key and key_file:
+            raise ValueError('ZHANGCHUI_API_KEY和ZHANGCHUI_API_KEY_FILE只设置一个')
+        if key_file:
+            try:
+                with Path(key_file).open('r', encoding='utf-8-sig') as stream:
+                    key = stream.read(257).strip()
+            except (OSError, UnicodeError) as error:
+                raise ValueError('无法读取密钥文件，请检查路径和权限') from error
+        try:
+            timeout = float(os.environ.get('ZHANGCHUI_TIMEOUT_SECONDS', '15'))
+            interval = float(os.environ.get('ZHANGCHUI_MIN_INTERVAL_SECONDS', '2'))
+        except ValueError:
+            raise ValueError('超时和请求间隔应填写数字') from None
         config = ClientConfig(base_url=args.base_url, allow_loopback_http=args.allow_loopback_http,
-            timeout_seconds=float(os.environ.get('ZHANGCHUI_TIMEOUT_SECONDS', '15')),
-            minimum_interval_seconds=float(os.environ.get('ZHANGCHUI_MIN_INTERVAL_SECONDS', '2')))
+            api_key=key,
+            timeout_seconds=timeout, minimum_interval_seconds=interval)
     except ValueError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(2) from error
