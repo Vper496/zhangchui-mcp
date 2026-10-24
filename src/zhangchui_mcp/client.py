@@ -16,6 +16,10 @@ from . import __version__
 API_SCHEMA = 'public-query/1'
 DEFAULT_BASE_URL = 'https://40kdata.online/api/v1/public-query'
 DATASET_TABLES = frozenset({'reports', 'faction_statistics', 'matchup_statistics'})
+GRANULAR_DATASET_SCHEMA = 'public-query-dataset/2'
+LEGACY_DATASET_SCHEMA = 'public-query-dataset/1'
+GRANULAR_DATASET_TABLES = frozenset({'reports', 'faction_statistics', 'matchup_statistics',
+                                     'detachment_statistics', 'roster_unit_statistics'})
 
 
 class QueryError(Exception):
@@ -79,19 +83,29 @@ def _identifier(value, name):
 
 def _parameters(parameters):
     allowed = {'release_id', 'dataset_revision', 'page', 'table', 'type', 'format', 'version_id', 'report_source',
-               'date_from', 'date_to', 'faction_id', 'opponent_id'}
+               'date_from', 'date_to', 'faction_id', 'opponent_id', 'detachment_id',
+               'opponent_detachment_id', 'schema', 'matrix', 'units_page'}
     if set(parameters) - allowed:
         raise QueryError('INVALID_ARGUMENT', '包含未支持的查询参数')
     result = {key: value for key, value in parameters.items() if value is not None}
     for key in ('release_id', 'dataset_revision'):
         if key in result:
             _identifier(result[key], key)
-    if 'table' in result and (not isinstance(result['table'], str) or result['table'] not in DATASET_TABLES):
+    if 'table' in result and (not isinstance(result['table'], str)
+                              or result['table'] not in GRANULAR_DATASET_TABLES):
         raise QueryError('INVALID_ARGUMENT', 'table须使用manifest列出的公开统计表名')
+    if 'schema' in result and result['schema'] not in (LEGACY_DATASET_SCHEMA, GRANULAR_DATASET_SCHEMA):
+        raise QueryError('INVALID_ARGUMENT', 'schema须使用支持的public-query-dataset版本')
     if 'page' in result and (type(result['page']) is not int or not 1 <= result['page'] <= 10000):
         raise QueryError('INVALID_ARGUMENT', 'page须为1到10000的整数')
+    if 'units_page' in result and (type(result['units_page']) is not int
+                                   or not 1 <= result['units_page'] <= 10000):
+        raise QueryError('INVALID_ARGUMENT', 'units_page须为1到10000的整数')
+    if 'matrix' in result and (not isinstance(result['matrix'], str)
+                               or result['matrix'] not in {'factions', 'detachments'}):
+        raise QueryError('INVALID_ARGUMENT', 'matrix须为factions或detachments')
     for key, value in result.items():
-        if key != 'page' and (not isinstance(value, str) or not value or len(value) > 160):
+        if key not in {'page', 'units_page'} and (not isinstance(value, str) or not value or len(value) > 160):
             raise QueryError('INVALID_ARGUMENT', '查询参数不能为空或过长')
     for key in ['date_from', 'date_to']:
         if key in result:
@@ -131,24 +145,38 @@ class PublicQueryClient:
         else:
             raise QueryError('INVALID_ARGUMENT', '工具只支持公开查询')
         params = _parameters(parameters)
+        dataset_resource = resource in {'dataset_manifest', 'dataset_rows'}
+        schema = params.get('schema') if dataset_resource else None
+        if not dataset_resource and schema is not None:
+            raise QueryError('INVALID_ARGUMENT', 'schema只适用于统计包查询')
         if resource == 'dataset_rows' and 'table' not in params:
             raise QueryError('INVALID_ARGUMENT', '请先从manifest选择table，再读取统计表')
         if resource != 'dataset_rows' and 'table' in params:
             raise QueryError('INVALID_ARGUMENT', '只有统计表读取支持table参数')
+        selected_schema = schema or LEGACY_DATASET_SCHEMA
+        table = params.get('table')
+        if table and ((selected_schema == LEGACY_DATASET_SCHEMA and table not in DATASET_TABLES)
+                      or (selected_schema == GRANULAR_DATASET_SCHEMA and table not in GRANULAR_DATASET_TABLES)):
+            raise QueryError('INVALID_ARGUMENT', '所选统计包schema没有该表，请先读取对应manifest')
+        request_params = dict(params)
+        # Omitting v1 is intentional: older public-query servers only know the original three-table contract.
+        if request_params.get('schema') == LEGACY_DATASET_SCHEMA:
+            request_params.pop('schema')
         url = self.config.base_url.rstrip('/') + path
-        if params:
-            url += '?' + urlencode(sorted(params.items()))
+        if request_params:
+            url += '?' + urlencode(sorted(request_params.items()))
         with self._lock:
             if self._last_finished is not None:
                 delay = self.config.minimum_interval_seconds - (self.clock() - self._last_finished)
                 if delay > 0:
                     self.sleep(delay)
             try:
-                return self._request(url, params.get('release_id'), params.get('dataset_revision'))
+                return self._request(url, params.get('release_id'), params.get('dataset_revision'),
+                                     resource=resource, schema=schema)
             finally:
                 self._last_finished = self.clock()
 
-    def _request(self, url, release_id, dataset_revision):
+    def _request(self, url, release_id, dataset_revision, *, resource=None, schema=None):
         if not self.config.api_key:
             raise QueryError('MCP_KEY_REQUIRED', '请在MCP配置里设置ZHANGCHUI_API_KEY，填写发放给你的密钥', status=401)
         cached = self._cache.get(url)
@@ -167,7 +195,14 @@ class PublicQueryClient:
                     return self._decode(cached[1], release_id, dataset_revision)
                 with error:
                     raw = error.read(min(self.config.response_limit_bytes, 65536) + 1)
-                    raise self._upstream_error(error.code, error.headers, raw)
+                    upstream_error = self._upstream_error(error.code, error.headers, raw)
+                    if (resource in {'dataset_manifest', 'dataset_rows'} and schema == GRANULAR_DATASET_SCHEMA
+                            and error.code == 400
+                            and upstream_error.document['error']['code'] == 'INVALID_FILTER'):
+                        raise QueryError('DATASET_SCHEMA_UNSUPPORTED',
+                                         '服务端尚不支持细分统计包；可将schema改为public-query-dataset/1读取原三张表。',
+                                         status=400)
+                    raise upstream_error
             with response:
                 if response.status != 200:
                     raise QueryError('UPSTREAM_PROTOCOL', '公开查询服务返回了未支持的成功状态')
@@ -180,6 +215,12 @@ class PublicQueryClient:
                 if len(raw) > self.config.response_limit_bytes:
                     raise QueryError('RESPONSE_TOO_LARGE', '服务响应超过读取上限，请缩小查询范围')
                 data = self._decode(raw, release_id, dataset_revision)
+                if schema == GRANULAR_DATASET_SCHEMA:
+                    declared = data.get('data', {}).get('schema') if resource == 'dataset_manifest' else None
+                    header_schema = data.get('meta', {}).get('dataset_schema')
+                    if declared != GRANULAR_DATASET_SCHEMA and header_schema != GRANULAR_DATASET_SCHEMA:
+                        raise QueryError('DATASET_SCHEMA_UNSUPPORTED',
+                                         '服务端没有返回细分统计包；可将schema改为public-query-dataset/1读取原三张表。')
                 etag = response.headers.get('ETag')
                 if etag and len(etag) <= 256:
                     self._remember(url, etag, raw)
@@ -194,6 +235,9 @@ class PublicQueryClient:
     def _decode(self, raw, release_id, dataset_revision):
         try:
             data = json.loads(raw, parse_constant=_invalid_number)
+            if not isinstance(data, dict) or not isinstance(data.get('meta'), dict) \
+                    or not isinstance(data.get('data'), dict):
+                raise ValueError()
             meta = data['meta']
             if meta['schema'] != API_SCHEMA or meta['read_only'] is not True or not meta['published_at']:
                 raise ValueError()

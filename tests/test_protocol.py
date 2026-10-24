@@ -31,6 +31,16 @@ class ProtocolTests(unittest.TestCase):
                     self.assertTrue(tool.annotations.read_only_hint)
                     self.assertFalse(tool.annotations.destructive_hint)
                     self.assertIn('dataset_revision', tool.input_schema['properties'])
+                self.assertIn('detachment_id', next(tool for tool in tools if tool.name == 'get_report')
+                              .input_schema['properties'])
+                self.assertIn('units_page', next(tool for tool in tools if tool.name == 'get_report')
+                              .input_schema['properties'])
+                self.assertIn('opponent_detachment_id', next(tool for tool in tools if tool.name == 'get_matchups')
+                              .input_schema['properties'])
+                self.assertIn('matrix', next(tool for tool in tools if tool.name == 'get_matchups')
+                              .input_schema['properties'])
+                self.assertIn('schema', next(tool for tool in tools if tool.name == 'get_dataset_manifest')
+                              .input_schema['properties'])
                 result = await client.call_tool('list_reports', {})
                 self.assertFalse(result.is_error)
                 self.assertIsNone(result.structured_content['data']['unknown'])
@@ -40,6 +50,38 @@ class ProtocolTests(unittest.TestCase):
                 invalid = await client.call_tool('get_report', {'report_id': '../../manage'})
                 self.assertTrue(invalid.is_error)
                 self.assertEqual([row[0] for row in api.calls], ['catalog', 'notes'])
+        anyio.run(check)
+
+    def test_existing_tools_forward_detachment_filters_and_default_v2_schema(self):
+        async def check():
+            api = FakePublicClient()
+            detachment = 'raw:' + 'e' * 64
+            opponent_detachment = 'raw:' + 'f' * 64
+            async with Client(create_server(api), cache=None) as client:
+                await client.call_tool('get_report', {'report_id': 'b' * 64, 'faction_id': 'tyranids',
+                                                      'detachment_id': detachment})
+                await client.call_tool('get_matchups', {'report_id': 'b' * 64, 'faction_id': 'tyranids',
+                                                        'opponent_id': 'orks', 'detachment_id': detachment,
+                                                        'opponent_detachment_id': opponent_detachment})
+                await client.call_tool('list_rosters', {'report_id': 'b' * 64, 'faction_id': 'tyranids',
+                                                        'detachment_id': detachment})
+                await client.call_tool('get_dataset_manifest', {})
+                await client.call_tool('get_report', {'report_id': 'b' * 64, 'units_page': 2})
+                await client.call_tool('get_matchups', {'report_id': 'b' * 64, 'matrix': 'detachments',
+                                                        'page': 2})
+                self.assertEqual(api.calls[0], ('report', {'report_id': 'b' * 64, 'faction_id': 'tyranids',
+                                                           'detachment_id': detachment,
+                                                           'release_id': None, 'dataset_revision': None}))
+                self.assertEqual(api.calls[1][1]['detachment_id'], detachment)
+                self.assertEqual(api.calls[1][1]['opponent_detachment_id'], opponent_detachment)
+                self.assertNotIn('matrix', api.calls[1][1])
+                self.assertEqual(api.calls[2][1]['detachment_id'], detachment)
+                self.assertEqual(api.calls[3][1]['schema'], 'public-query-dataset/2')
+                self.assertEqual(api.calls[4], ('report', {'report_id': 'b' * 64, 'faction_id': None,
+                                                           'detachment_id': None, 'release_id': None,
+                                                           'dataset_revision': None, 'units_page': 2}))
+                self.assertEqual(api.calls[5][1]['matrix'], 'detachments')
+                self.assertEqual(api.calls[5][1]['page'], 2)
         anyio.run(check)
 
     def test_real_sdk_forwards_fixed_revisions_on_every_tool(self):

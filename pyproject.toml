@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zhangchui-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Read-only MCP adapter for published Zhangchui Warhammer 40,000 reports"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 
-from zhangchui_mcp.client import ClientConfig, PublicQueryClient, QueryError
+from zhangchui_mcp.client import (ClientConfig, PublicQueryClient, QueryError, GRANULAR_DATASET_SCHEMA,
+                                  LEGACY_DATASET_SCHEMA)
 
 
 RELEASE = 'a' * 64
@@ -173,6 +174,18 @@ class PublicQueryClientTests(unittest.TestCase):
                 PublicQueryClient(self.config(), opener=Opener(response)).query('catalog', release_id=RELEASE)
             self.assertEqual(raised.exception.document['error']['code'], 'UPSTREAM_PROTOCOL')
 
+    def test_non_object_response_data_is_rejected_as_protocol_error(self):
+        for payload in (None, [], 'not an object'):
+            with self.subTest(payload_type=type(payload).__name__):
+                invalid = document(schema=GRANULAR_DATASET_SCHEMA)
+                invalid['meta']['dataset_schema'] = GRANULAR_DATASET_SCHEMA
+                invalid['data'] = payload
+                client = PublicQueryClient(self.config(), opener=Opener(Response(invalid)))
+                with self.assertRaises(QueryError) as raised:
+                    client.query('dataset_manifest', schema=GRANULAR_DATASET_SCHEMA)
+                self.assertEqual(raised.exception.document['error']['code'], 'UPSTREAM_PROTOCOL')
+                self.assertFalse(client._cache)
+
     def test_paths_parameters_and_non_https_configuration_are_rejected(self):
         for url in ['http://example.com/api', 'https://user:password@example.com/api',
                     'https://example.com/api?token=secret', 'file:///etc/passwd']:
@@ -180,7 +193,9 @@ class PublicQueryClientTests(unittest.TestCase):
                 self.config(base_url=url)
         self.config(base_url='http://127.0.0.1:8123/api', allow_loopback_http=True)
         client = PublicQueryClient(self.config(), opener=Opener())
-        for parameters in [{'url': 'http://localhost'}, {'page': True}, {'page': 0}, {'date_from': '20261022'}]:
+        for parameters in [{'url': 'http://localhost'}, {'page': True}, {'page': 0},
+                           {'units_page': True}, {'units_page': 0}, {'matrix': 'players'}, {'matrix': []},
+                           {'date_from': '20261022'}]:
             with self.assertRaises(QueryError):
                 client.query('catalog', **parameters)
         with self.assertRaises(QueryError):
@@ -267,6 +282,51 @@ class PublicQueryClientTests(unittest.TestCase):
             with self.subTest(resource=resource, parameters=parameters), self.assertRaises(QueryError):
                 client.query(resource, **parameters)
         self.assertEqual(len(opener.calls), 2)
+
+    def test_report_detail_page_and_detachment_matrix_parameters_are_forwarded(self):
+        opener = Opener(Response(), Response())
+        client = PublicQueryClient(self.config(), opener=opener)
+        client.query('report', report_id=REPORT, units_page=2, release_id=RELEASE,
+                     dataset_revision=REVISION)
+        client.query('matchups', report_id=REPORT, matrix='detachments', page=2,
+                     release_id=RELEASE, dataset_revision=REVISION)
+        self.assertIn('units_page=2', opener.calls[0][0].full_url)
+        self.assertIn('dataset_revision=' + REVISION, opener.calls[0][0].full_url)
+        self.assertIn('matrix=detachments', opener.calls[1][0].full_url)
+        self.assertIn('page=2', opener.calls[1][0].full_url)
+        self.assertIn('dataset_revision=' + REVISION, opener.calls[1][0].full_url)
+
+    def test_v2_is_explicit_while_v1_omits_schema_for_old_server_compatibility(self):
+        legacy = document(schema=LEGACY_DATASET_SCHEMA)
+        granular = document(schema=GRANULAR_DATASET_SCHEMA)
+        granular['meta']['dataset_schema'] = GRANULAR_DATASET_SCHEMA
+        opener = Opener(Response(legacy), Response(granular))
+        client = PublicQueryClient(self.config(), opener=opener)
+        client.query('dataset_manifest', schema=LEGACY_DATASET_SCHEMA)
+        client.query('dataset_manifest', schema=GRANULAR_DATASET_SCHEMA)
+        self.assertTrue(opener.calls[0][0].full_url.endswith('/datasets/manifest'))
+        self.assertIn('schema=public-query-dataset%2F2', opener.calls[1][0].full_url)
+
+    def test_v2_request_to_an_old_or_ignoring_server_is_explicitly_unavailable(self):
+        legacy = document(schema=LEGACY_DATASET_SCHEMA)
+        old_server = PublicQueryClient(self.config(), opener=Opener(Response(legacy)))
+        with self.assertRaises(QueryError) as raised:
+            old_server.query('dataset_manifest', schema=GRANULAR_DATASET_SCHEMA)
+        self.assertEqual(raised.exception.document['error']['code'], 'DATASET_SCHEMA_UNSUPPORTED')
+        self.assertFalse(old_server._cache)
+
+        rejected = error(400, code='INVALID_FILTER')
+        older_server = PublicQueryClient(self.config(), opener=Opener(rejected))
+        with self.assertRaises(QueryError) as raised:
+            older_server.query('dataset_rows', table='detachment_statistics',
+                               schema=GRANULAR_DATASET_SCHEMA, page=1)
+        self.assertEqual(raised.exception.document['error']['code'], 'DATASET_SCHEMA_UNSUPPORTED')
+
+    def test_v2_and_legacy_table_names_are_bound_to_the_selected_schema(self):
+        client = PublicQueryClient(self.config(), opener=Opener())
+        with self.assertRaises(QueryError):
+            client.query('dataset_rows', table='detachment_statistics', schema=LEGACY_DATASET_SCHEMA)
+        self.assertEqual(client._cache, {})
 
     def test_concurrent_tools_have_only_one_http_request_in_flight(self):
         class ConcurrentOpener:
