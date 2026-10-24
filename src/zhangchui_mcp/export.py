@@ -100,8 +100,11 @@ def _target_path(output):
 
 
 def _progress_directory(target):
-    identity = hashlib.sha256(os.fsencode(os.path.normcase(str(target)))).hexdigest()[:24]
-    return target.parent / ('.zhangchui-export-' + identity)
+    target = Path(os.path.abspath(os.fspath(target)))
+    parent = target.parent.resolve()
+    canonical_target = parent / target.name
+    identity = hashlib.sha256(os.fsencode(os.path.normcase(str(canonical_target)))).hexdigest()[:24]
+    return parent / ('.zhangchui-export-' + identity)
 
 
 def _page_filename(name, number):

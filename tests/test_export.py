@@ -377,6 +377,10 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(row_calls.count(('faction_statistics', 2)), 2)
         self.assertEqual(row_calls.count(('faction_statistics', 3)), 1)
 
+    def test_progress_directory_uses_canonical_parent_for_output_aliases(self):
+        canonical_output = self.output.parent.resolve() / self.output.name
+        self.assertEqual(_progress_directory(self.output), _progress_directory(canonical_output))
+
     def test_nonmatching_partial_page_is_preserved_and_rejected(self):
         manifest, pages = multipage_fixture()
         client = QuotaOnceClient(manifest, pages, fail_at=('faction_statistics', 2))
