@@ -26,11 +26,16 @@ class ProtocolTests(unittest.TestCase):
                 tools = (await client.list_tools()).tools
                 names = {tool.name for tool in tools}
                 self.assertEqual(names, {'list_reports', 'get_report', 'get_matchups', 'list_rosters',
-                                         'get_roster', 'get_data_notes', 'get_dataset_manifest', 'get_dataset_rows'})
+                                         'get_roster', 'get_data_notes', 'get_dataset_manifest', 'get_dataset_rows',
+                                         'get_faction_analysis', 'get_faction_detachments', 'get_faction_units',
+                                         'list_report_events', 'list_units', 'get_unit'})
                 for tool in tools:
                     self.assertTrue(tool.annotations.read_only_hint)
                     self.assertFalse(tool.annotations.destructive_hint)
-                    self.assertIn('dataset_revision', tool.input_schema['properties'])
+                    if tool.name not in {'list_units', 'get_unit'}:
+                        self.assertIn('dataset_revision', tool.input_schema['properties'])
+                    else:
+                        self.assertNotIn('dataset_revision', tool.input_schema['properties'])
                 self.assertIn('detachment_id', next(tool for tool in tools if tool.name == 'get_report')
                               .input_schema['properties'])
                 self.assertIn('units_page', next(tool for tool in tools if tool.name == 'get_report')
@@ -104,6 +109,28 @@ class ProtocolTests(unittest.TestCase):
                 failed = await client.call_tool('get_dataset_rows', {'table': '../../manage', **fixed})
                 self.assertTrue(failed.is_error)
                 self.assertEqual(len(api.calls), before)
+        anyio.run(check)
+
+    def test_new_tools_forward_native_filters_and_separate_unit_library_scope(self):
+        async def check():
+            api = FakePublicClient()
+            fixed = {'release_id': 'a' * 64, 'dataset_revision': 'c' * 64}
+            selection = {'faction_id': 'tyranids', 'mfm_group': 'v1.4',
+                         'date_from': '2026-10-01', 'date_to': '2026-10-31', **fixed}
+            async with Client(create_server(api), cache=None) as client:
+                for name in ('get_faction_analysis', 'get_faction_detachments', 'get_faction_units'):
+                    result = await client.call_tool(name, selection)
+                    self.assertFalse(result.is_error)
+                await client.call_tool('list_report_events', {'report_id': 'b' * 64, 'page': 2, **fixed})
+                await client.call_tool('list_units', {'q': '测试单位', 'faction': '泰伦虫族'})
+                await client.call_tool('get_unit', {'source_id': '1', 'name': 'Test Unit', 'faction': '泰伦虫族'})
+            self.assertEqual([item[0] for item in api.calls], [
+                'faction_analysis', 'faction_detachments', 'faction_units', 'report_events', 'unit_catalog', 'unit'])
+            for _, values in api.calls[:3]:
+                self.assertEqual({key: values[key] for key in selection}, selection)
+            for _, values in api.calls[4:]:
+                self.assertNotIn('release_id', values)
+                self.assertNotIn('dataset_revision', values)
         anyio.run(check)
 
 

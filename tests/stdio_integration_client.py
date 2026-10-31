@@ -25,13 +25,37 @@ async def main():
     result = {'transport': 'stdio', 'tools': [], 'successful_calls': []}
     async with Client(parameters, cache=None, read_timeout_seconds=15) as client:
         result['tools'] = sorted(tool.name for tool in (await client.list_tools()).tools)
-        assert len(result['tools']) == 8
+        assert len(result['tools']) == 14
         catalog = await client.call_tool('list_reports', {'release_id': fixture['release_id']})
         assert not catalog.is_error, catalog
         assert any(row['report_id'] == report_id for row in catalog.structured_content['data']['items'])
         revision = catalog.structured_content['meta']['dataset_revision']
         pinned['dataset_revision'] = revision
         result['successful_calls'].append('list_reports')
+        # Keep the existing quota and pacing checks intact; a second user checks the six new tools.
+        feature_parameters = StdioServerParameters(command=parameters.command, args=parameters.args,
+            env={**parameters.env, 'ZHANGCHUI_API_KEY_FILE': fixture['feature_key_file']})
+        async with Client(feature_parameters, cache=None, read_timeout_seconds=15) as feature_client:
+            analysis_selection = {'faction_id': 'orks', 'format': 'individual',
+                                  'date_from': '2026-01-01', 'date_to': '2026-12-31',
+                                  'release_id': fixture['release_id'], 'dataset_revision': revision}
+            for name in ('get_faction_analysis', 'get_faction_detachments', 'get_faction_units'):
+                response = await feature_client.call_tool(name, analysis_selection)
+                assert not response.is_error, response
+                assert response.structured_content['meta']['dataset_revision'] == revision
+                result['successful_calls'].append(name)
+            events = await feature_client.call_tool('list_report_events', pinned)
+            assert not events.is_error, events
+            assert events.structured_content['data']['count'] > 0
+            result['successful_calls'].append('list_report_events')
+            catalog_units = await feature_client.call_tool('list_units', {'faction': '欧克蛮人', 'q': 'Warboss'})
+            assert not catalog_units.is_error, catalog_units
+            assert catalog_units.structured_content['data']['items'][0]['source_id'] == '1'
+            saved_unit = await feature_client.call_tool('get_unit', {'source_id': '1', 'name': 'Warboss', 'faction': '欧克蛮人'})
+            assert not saved_unit.is_error, saved_unit
+            assert saved_unit.structured_content['meta']['scope'] == 'saved_unit_library'
+            assert 'release_id' not in saved_unit.structured_content['meta']
+            result['successful_calls'].extend(['list_units', 'get_unit'])
         report_detail = None
         for tool in ['get_report', 'get_matchups', 'list_rosters', 'get_data_notes']:
             response = await client.call_tool(tool, pinned)
@@ -117,9 +141,23 @@ async def main():
         expected_report_detachment = next(
             row for row in report_detachments if row.get('detachment_id') == expected_detachment_id)
         assert expected_report_detachment.get('label'), 'public report must expose its translated detachment label'
-        assert any(row.get('detachment_id') == expected_detachment_id
-                   and row.get('label') == expected_report_detachment['label']
-                   for row in new_table_rows['detachment_statistics']), new_table_rows['detachment_statistics']
+        expected_exported_detachment = next(row for row in new_table_rows['detachment_statistics']
+            if row.get('report_id') == report_id and row.get('row_scope') == 'faction'
+            and row.get('detachment_id') == expected_detachment_id)
+        assert expected_exported_detachment['label'] == expected_report_detachment['label']
+        assert expected_report_detachment['faction_usage'] == 0.5
+        assert expected_report_detachment['faction_usage_denominator'] == 2
+        for field in ('faction_usage', 'faction_usage_denominator'):
+            assert expected_report_detachment[field] == expected_exported_detachment[field]
+        filtered_report = await client.call_tool('get_report', {
+            **pinned, 'faction_id': 'orks', 'detachment_id': expected_detachment_id,
+        })
+        assert not filtered_report.is_error, filtered_report
+        filtered_rows = filtered_report.structured_content['data']['granularity']['detachments']['factions']
+        assert len(filtered_rows) == 1
+        assert filtered_rows[0]['faction_usage'] == 0.5
+        assert filtered_rows[0]['faction_usage_denominator'] == 2
+        result['successful_calls'].append('get_report_filtered_faction_usage')
         assert new_table_rows['roster_unit_statistics'], 'v2 roster unit table must contain parsed synthetic units'
         assert any(row.get('name_label') == 'Warboss' for row in new_table_rows['roster_unit_statistics'])
         result['successful_calls'].append('get_dataset_rows_v2')
@@ -129,6 +167,8 @@ async def main():
             'synthetic_detachment_visible': True,
             'detachment_id': expected_detachment_id,
             'detachment_label_matches_report': expected_report_detachment['label'],
+            'faction_usage': expected_report_detachment['faction_usage'],
+            'faction_usage_denominator': expected_report_detachment['faction_usage_denominator'],
             'synthetic_parseable_unit_visible': True,
         }
         legacy = await client.call_tool('get_dataset_manifest', {

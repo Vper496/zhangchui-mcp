@@ -14,6 +14,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from . import __version__
 
 API_SCHEMA = 'public-query/1'
+UNIT_API_SCHEMA = 'public-unit-query/1'
 DEFAULT_BASE_URL = 'https://40kdata.online/api/v1/public-query'
 DATASET_TABLES = frozenset({'reports', 'faction_statistics', 'matchup_statistics'})
 GRANULAR_DATASET_SCHEMA = 'public-query-dataset/2'
@@ -84,7 +85,8 @@ def _identifier(value, name):
 def _parameters(parameters):
     allowed = {'release_id', 'dataset_revision', 'page', 'table', 'type', 'format', 'version_id', 'report_source',
                'date_from', 'date_to', 'faction_id', 'opponent_id', 'detachment_id',
-               'opponent_detachment_id', 'schema', 'matrix', 'units_page'}
+               'opponent_detachment_id', 'schema', 'matrix', 'units_page', 'mfm_group',
+               'sort', 'direction', 'faction', 'q', 'name'}
     if set(parameters) - allowed:
         raise QueryError('INVALID_ARGUMENT', '包含未支持的查询参数')
     result = {key: value for key, value in parameters.items() if value is not None}
@@ -128,13 +130,23 @@ class PublicQueryClient:
         self._last_finished = None
         self._cache = OrderedDict()
 
-    def query(self, resource, *, report_id=None, case_id=None, **parameters):
+    def query(self, resource, *, report_id=None, case_id=None, source_id=None, **parameters):
         suffixes = {'catalog': '', 'report': '', 'matchups': '/matchups',
-                    'rosters': '/rosters', 'roster': '/rosters/', 'notes': '/data-notes'}
+                    'rosters': '/rosters', 'roster': '/rosters/', 'notes': '/data-notes',
+                    'report_events': '/events'}
         if not isinstance(resource, str):
             raise QueryError('INVALID_ARGUMENT', '工具只支持公开查询')
         if resource in {'dataset_manifest', 'dataset_rows'}:
             path = '/datasets/' + ('manifest' if resource == 'dataset_manifest' else 'rows')
+        elif resource in {'faction_analysis', 'faction_detachments', 'faction_units'}:
+            path = '/analysis/' + {'faction_analysis': 'faction', 'faction_detachments': 'detachments',
+                                   'faction_units': 'units'}[resource]
+        elif resource in {'unit_catalog', 'unit'}:
+            path = '/units'
+            if resource == 'unit':
+                if not isinstance(source_id, str) or not re.fullmatch(r'[1-9][0-9]{0,19}', source_id):
+                    raise QueryError('INVALID_ARGUMENT', 'source_id须使用目录返回的数字单位ID')
+                path += '/' + source_id
         elif resource in suffixes:
             path = '/reports'
             if resource != 'catalog':
@@ -145,6 +157,12 @@ class PublicQueryClient:
         else:
             raise QueryError('INVALID_ARGUMENT', '工具只支持公开查询')
         params = _parameters(parameters)
+        if resource in {'unit_catalog', 'unit'}:
+            allowed = {'faction', 'q', 'page'} if resource == 'unit_catalog' else {'faction', 'name'}
+            if set(params) - allowed or params.get('page', 1) > 100:
+                raise QueryError('INVALID_ARGUMENT', '单位查询只支持目录名称、阵营和有效页码，不使用报告发布参数')
+            if resource == 'unit' and not all(params.get(key) for key in ('faction', 'name')):
+                raise QueryError('INVALID_ARGUMENT', '请提供目录返回的完整名称和阵营')
         dataset_resource = resource in {'dataset_manifest', 'dataset_rows'}
         schema = params.get('schema') if dataset_resource else None
         if not dataset_resource and schema is not None:
@@ -192,7 +210,7 @@ class PublicQueryClient:
                 if error.code == 304 and cached:
                     error.close()
                     self._cache.move_to_end(url)
-                    return self._decode(cached[1], release_id, dataset_revision)
+                    return self._decode(cached[1], release_id, dataset_revision, resource=resource)
                 with error:
                     raw = error.read(min(self.config.response_limit_bytes, 65536) + 1)
                     upstream_error = self._upstream_error(error.code, error.headers, raw)
@@ -214,7 +232,7 @@ class PublicQueryClient:
                 raw = response.read(self.config.response_limit_bytes + 1)
                 if len(raw) > self.config.response_limit_bytes:
                     raise QueryError('RESPONSE_TOO_LARGE', '服务响应超过读取上限，请缩小查询范围')
-                data = self._decode(raw, release_id, dataset_revision)
+                data = self._decode(raw, release_id, dataset_revision, resource=resource)
                 if schema == GRANULAR_DATASET_SCHEMA:
                     declared = data.get('data', {}).get('schema') if resource == 'dataset_manifest' else None
                     header_schema = data.get('meta', {}).get('dataset_schema')
@@ -232,20 +250,27 @@ class PublicQueryClient:
             self._cache.pop(url, None)
             raise QueryError('CONNECTION_FAILED', '无法连接公开查询服务，请稍后重试') from error
 
-    def _decode(self, raw, release_id, dataset_revision):
+    def _decode(self, raw, release_id, dataset_revision, *, resource=None):
         try:
             data = json.loads(raw, parse_constant=_invalid_number)
             if not isinstance(data, dict) or not isinstance(data.get('meta'), dict) \
                     or not isinstance(data.get('data'), dict):
                 raise ValueError()
             meta = data['meta']
-            if meta['schema'] != API_SCHEMA or meta['read_only'] is not True or not meta['published_at']:
+            unit_query = resource in {'unit_catalog', 'unit'}
+            if unit_query:
+                if (meta.get('schema') != UNIT_API_SCHEMA or meta.get('read_only') is not True
+                        or meta.get('scope') != 'saved_unit_library'
+                        or not re.fullmatch('[0-9a-f]{64}', meta.get('content_sha256', ''))):
+                    raise ValueError()
+            elif meta['schema'] != API_SCHEMA or meta['read_only'] is not True or not meta['published_at']:
                 raise ValueError()
-            if not isinstance(meta['release_id'], str) or not re.fullmatch('[0-9a-f]{64}', meta['release_id']):
-                raise ValueError()
-            datetime.fromisoformat(meta['published_at'].replace('Z', '+00:00'))
-            if release_id is not None and meta['release_id'] != release_id:
-                raise ValueError()
+            if not unit_query:
+                if not isinstance(meta['release_id'], str) or not re.fullmatch('[0-9a-f]{64}', meta['release_id']):
+                    raise ValueError()
+                datetime.fromisoformat(meta['published_at'].replace('Z', '+00:00'))
+                if release_id is not None and meta['release_id'] != release_id:
+                    raise ValueError()
             # Unpinned calls remain compatible with older servers. A pinned call
             # must prove its revision, even if an upstream incorrectly returns 200.
             revision = meta.get('dataset_revision')

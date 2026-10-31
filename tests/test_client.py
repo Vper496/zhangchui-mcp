@@ -54,6 +54,29 @@ class PublicQueryClientTests(unittest.TestCase):
     def config(self, **values):
         return ClientConfig(minimum_interval_seconds=0, api_key=TEST_KEY, **values)
 
+    def test_native_analysis_routes_and_saved_unit_schema_have_separate_version_scopes(self):
+        opener = Opener(Response(), Response(), Response(), Response())
+        client = PublicQueryClient(self.config(), opener=opener)
+        for resource in ('faction_analysis', 'faction_detachments', 'faction_units'):
+            client.query(resource, faction_id='tyranids', format='individual', mfm_group='v1.4',
+                         date_from='2026-10-01', date_to='2026-10-31', dataset_revision=REVISION)
+        client.query('report_events', report_id=REPORT, page=2, release_id=RELEASE)
+        self.assertTrue(all('/analysis/' in row[0].full_url for row in opener.calls[:3]))
+        self.assertIn('/reports/' + REPORT + '/events?', opener.calls[3][0].full_url)
+        unit = {'data': {'unit': {'source_id': '1'}}, 'meta': {'schema': 'public-unit-query/1',
+                'scope': 'saved_unit_library', 'content_sha256': 'd' * 64, 'read_only': True, 'stale': True}}
+        unit_opener = Opener(Response(unit, headers={'ETag': 'saved'}), error(304))
+        unit_client = PublicQueryClient(self.config(), opener=unit_opener)
+        for _ in range(2):
+            response = unit_client.query('unit', source_id='1', name='Test Unit', faction='泰伦虫族')
+            self.assertTrue(response['meta']['stale'])
+        self.assertEqual(unit_opener.calls[1][0].get_header('If-none-match'), 'saved')
+        with self.assertRaises(QueryError):
+            unit_client.query('unit_catalog', release_id=RELEASE)
+        wrong_scope = PublicQueryClient(self.config(), opener=Opener(Response(unit)))
+        with self.assertRaises(QueryError):
+            wrong_scope.query('catalog')
+
     def test_get_only_request_retains_null_version_and_filters(self):
         opener = Opener(Response())
         client = PublicQueryClient(self.config(), opener=opener)
